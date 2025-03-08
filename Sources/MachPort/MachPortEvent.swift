@@ -8,21 +8,28 @@ public final class MachPortEvent: @unchecked Sendable {
   public let eventSource: CGEventSource?
   public let isRepeat: Bool
   public let type: CGEventType
-  public let lhs: Bool
   public var result: Unmanaged<CGEvent>?
 
-  internal init(id: UUID,
-                event: CGEvent, eventSource: CGEventSource?,
-                isRepeat: Bool, lhs: Bool, type: CGEventType,
+  internal init(id: UUID, event: CGEvent, eventSource: CGEventSource?,
+                isRepeat: Bool, type: CGEventType,
                 result: Unmanaged<CGEvent>?) {
     self.id = id
     self.keyCode = event.getIntegerValueField(.keyboardEventKeycode)
     self.isRepeat = isRepeat
     self.event = event
     self.eventSource = eventSource
-    self.lhs = lhs
     self.type = type
     self.result = result
+  }
+
+  public init(id: UUID, event: CGEvent, isRepeat: Bool = false) {
+    self.id = id
+    self.keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+    self.isRepeat = isRepeat
+    self.event = event
+    self.eventSource = nil
+    self.type = event.type
+    self.result = nil
   }
 
   public static func empty() -> MachPortEvent? {
@@ -32,7 +39,6 @@ public final class MachPortEvent: @unchecked Sendable {
       event: event,
       eventSource:  nil,
       isRepeat: false,
-      lhs:  false,
       type:  .null,
       result: nil
     )

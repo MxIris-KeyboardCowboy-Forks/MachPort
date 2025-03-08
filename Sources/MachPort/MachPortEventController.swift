@@ -2,6 +2,14 @@ import Carbon
 import Cocoa
 import os
 
+public enum MachPortError: Error {
+  case failedToCreateCGEventSource
+  case failedToCreateCFRunLoopSource
+  case failedToCreateMachPort
+  case failedToCreateKeyCode(Int)
+  case failedToCreateEvent
+}
+
 public class MachPortEventPublisher {
   @Published public internal(set) var flagsChanged: CGEventFlags?
   @Published public internal(set) var event: MachPortEvent?
@@ -15,7 +23,6 @@ public final class MachPortEventController: MachPortEventPublisher, @unchecked S
   private var previousId: UUID?
   private var machPort: CFMachPort?
   private var runLoopSource: CFRunLoopSource?
-  private static var lhs: Bool = true
   private var currentMode: CFRunLoopMode = .commonModes
   public var onEventChange: ((MachPortEvent) -> Void)? = nil
   public var onFlagsChanged: ((MachPortEvent) -> Void)? = nil
@@ -43,8 +50,8 @@ public final class MachPortEventController: MachPortEventPublisher, @unchecked S
       self.eventsOfInterest = eventsOfInterest
     } else {
       self.eventsOfInterest = 1 << CGEventType.keyDown.rawValue
-      | 1 << CGEventType.keyUp.rawValue
-      | 1 << CGEventType.flagsChanged.rawValue
+                            | 1 << CGEventType.keyUp.rawValue
+                            | 1 << CGEventType.flagsChanged.rawValue
     }
     self.eventSourceId = eventSourceId
     self.signature = Int64(signature.hashValue)
@@ -70,6 +77,7 @@ public final class MachPortEventController: MachPortEventPublisher, @unchecked S
     self.machPort = machPort
     self.currentMode = mode
     self.runLoopSource = try CFRunLoopSource.create(with: machPort)
+    self.isEnabled = true
 
     CFRunLoopAddSource(runLoop, runLoopSource, mode)
   }
@@ -77,6 +85,7 @@ public final class MachPortEventController: MachPortEventPublisher, @unchecked S
   public func stop(in runLoop: CFRunLoop = CFRunLoopGetMain(), mode: CFRunLoopMode) {
     CFRunLoopRemoveSource(runLoop, runLoopSource, mode)
     guard let machPort else { return }
+    self.isEnabled = false
     CFMachPortInvalidate(machPort)
     self.runLoopSource = nil
   }
@@ -93,15 +102,15 @@ public final class MachPortEventController: MachPortEventPublisher, @unchecked S
 
   public func createEvent(_ key: Int, type: CGEventType, flags: CGEventFlags,
                           tapLocation: CGEventTapLocation = .cghidEventTap,
-                          configure: (CGEvent) -> Void = { _ in }) throws -> CGEvent {
+                          configure: (CGEvent) -> Void = { _ in }) throws(MachPortError) -> CGEvent {
     guard let cgKeyCode = CGKeyCode(exactly: key) else {
-      throw MachPortError.failedToCreateKeyCode(key)
+      throw .failedToCreateKeyCode(key)
     }
 
     guard let cgEvent = CGEvent(keyboardEventSource: eventSource,
                                 virtualKey: cgKeyCode,
                                 keyDown: type == .keyDown) else {
-      throw MachPortError.failedToCreateEvent
+      throw .failedToCreateEvent
     }
 
     cgEvent.setIntegerValueField(.eventSourceUserData, value: signature)
@@ -113,14 +122,35 @@ public final class MachPortEventController: MachPortEventPublisher, @unchecked S
   }
 
   @discardableResult
+  public func post(_ flags: CGEventFlags, tapLocation: CGEventTapLocation = .cghidEventTap) throws -> CGEvent {
+    guard let cgEvent = CGEvent(source: eventSource) else {
+      throw MachPortError.failedToCreateEvent
+    }
+
+    cgEvent.type = .flagsChanged
+    cgEvent.flags = flags
+    cgEvent.setIntegerValueField(.eventSourceUserData, value: signature)
+    cgEvent.post(tap: tapLocation)
+
+    return cgEvent
+  }
+
+  @discardableResult
   public func post(_ key: Int, type: CGEventType, flags: CGEventFlags,
                    tapLocation: CGEventTapLocation = .cghidEventTap,
                    configure: (CGEvent) -> Void = { _ in }) throws -> CGEvent {
     let cgEvent = try createEvent(key, type: type, flags: flags,
                                   tapLocation: tapLocation, configure: configure)
-
     cgEvent.post(tap: tapLocation)
 
+    return cgEvent
+  }
+
+  @discardableResult
+  public func repost(_ machPortEvent: MachPortEvent, tapLocation: CGEventTapLocation = .cghidEventTap) -> CGEvent {
+    let cgEvent = machPortEvent.event
+    cgEvent.setIntegerValueField(.eventSourceUserData, value: signature)
+    cgEvent.post(tap: tapLocation)
     return cgEvent
   }
 
@@ -181,19 +211,15 @@ public final class MachPortEventController: MachPortEventPublisher, @unchecked S
       id: id,
       event: cgEvent, eventSource: eventSource,
       isRepeat: isRepeat,
-      lhs: Self.lhs, type: type,
+      type: type,
       result: result)
 
     if let onAllEventChange {
-      if type == .flagsChanged {
-        Self.lhs = determineModifierKeysLocation(cgEvent)
-      }
       onAllEventChange(newEvent)
       return newEvent.result
     }
 
     if type == .flagsChanged {
-      Self.lhs = determineModifierKeysLocation(cgEvent)
       if let onFlagsChanged {
         onFlagsChanged(newEvent)
       } else {
@@ -210,28 +236,7 @@ public final class MachPortEventController: MachPortEventPublisher, @unchecked S
     return newEvent.result
   }
 
-  private final func determineModifierKeysLocation(_ cgEvent: CGEvent) -> Bool {
-    var result: Bool = true
-    let emptyFlags = cgEvent.flags == CGEventFlags.maskNonCoalesced
-
-    if !emptyFlags {
-      let keyCode = cgEvent.getIntegerValueField(.keyboardEventKeycode)
-
-      // Always return `true` if the function key is involved
-      if keyCode == kVK_Function {
-        return true
-      }
-
-      let rhs: Set<Int> = [kVK_RightCommand, kVK_RightOption, kVK_RightShift]
-      result = !rhs.contains(Int(keyCode))
-    } else if emptyFlags {
-      result = true
-    }
-
-    return result
-  }
-
-  private final func createMachPort(_ currentMode: CFRunLoopMode) throws -> CFMachPort {
+  private final func createMachPort(_ currentMode: CFRunLoopMode) throws(MachPortError) -> CFMachPort {
     let userInfo = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
 
     guard let machPort = CGEvent.tapCreate(
@@ -244,16 +249,17 @@ public final class MachPortEventController: MachPortEventPublisher, @unchecked S
           let controller = Unmanaged<MachPortEventController>
             .fromOpaque(pointer)
             .takeUnretainedValue()
-          if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            try? controller.reload(mode: controller.currentMode)
-            return Unmanaged.passUnretained(event)
-          } else {
-            return controller.callback(proxy, type, event)
+          if let machPort = controller.machPort,
+              type == .tapDisabledByTimeout ||
+              type == .tapDisabledByUserInput {
+            CGEvent.tapEnable(tap: machPort, enable: true)
           }
+
+          return controller.callback(proxy, type, event)
         }
         return Unmanaged.passUnretained(event)
       }, userInfo: userInfo) else {
-      throw MachPortError.failedToCreateMachPort
+      throw .failedToCreateMachPort
     }
     return machPort
   }
